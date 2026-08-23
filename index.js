@@ -1,5 +1,42 @@
 const express = require('express');
 const cors = require('cors');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+
+app.get('/match/:id', async (req, res) => {
+  try {
+    const matchId = req.params.id;
+
+    // Utilisation d'un scraper / proxy tiers plus robuste aux règles Cloudflare
+    const response = await fetch(`https://hltv-api.vercel.app/api/match.json?id=${matchId}`);
+    
+    if (!response.ok) {
+      throw new Error(`Statut HTTP: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    // Normalisation des données envoyées à React
+    res.json({
+      id: matchId,
+      team1: { name: data.team1?.name || data.teams?.[0]?.name || 'Équipe 1' },
+      team2: { name: data.team2?.name || data.teams?.[1]?.name || 'Équipe 2' },
+      event: { name: data.event?.name || data.eventName || 'Tournoi CS2' },
+      format: data.format || 'BO3'
+    });
+  } catch (error) {
+    console.error('Erreur Proxy HLTV:', error.message);
+    res.status(500).json({ error: 'Impossible de récupérer les infos HLTV.' });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Serveur prêt sur le port ${PORT}`);
+});const express = require('express');
+const cors = require('cors');
 const { HLTV } = require('hltv');
 
 const app = express();
