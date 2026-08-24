@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import HLTV from "hltv";
+import { HLTV } from "hltv";
 
 /* ============================================================================
    CS2 VOD FR — Proxy HLTV

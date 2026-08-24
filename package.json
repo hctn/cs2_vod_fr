@@ -13,7 +13,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "hltv": "^4.5.0"
+    "hltv": "^3.5.0"
   },
   "license": "MIT"
 }
