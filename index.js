@@ -20,6 +20,13 @@ const HLTV_TIMEOUT_MS = 20 * 1000; // on ne laisse jamais une requête pendre in
 
 app.use(cors()); // ouvert à tous les domaines : c'est une API publique en lecture seule
 
+// Log d'accès minimal : indispensable pour savoir si une requête arrive vraiment
+// jusqu'ici (utile pour distinguer "le serveur ne reçoit rien" d'un vrai bug interne).
+app.use((req, res, next) => {
+  console.log(`[cs2-vod-fr] ${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
+  next();
+});
+
 // Filet de sécurité : une erreur non interceptée dans got-scraping/cheerio ne doit
 // jamais faire planter tout le process (ce qui casserait TOUTES les requêtes en
 // cours, pas seulement celle qui a échoué, et se traduit côté navigateur par une
