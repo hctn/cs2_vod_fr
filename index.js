@@ -16,8 +16,31 @@ import { HLTV } from "hltv";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HLTV_TIMEOUT_MS = 20 * 1000; // on ne laisse jamais une requête pendre indéfiniment
 
 app.use(cors()); // ouvert à tous les domaines : c'est une API publique en lecture seule
+
+// Filet de sécurité : une erreur non interceptée dans got-scraping/cheerio ne doit
+// jamais faire planter tout le process (ce qui casserait TOUTES les requêtes en
+// cours, pas seulement celle qui a échoué, et se traduit côté navigateur par une
+// simple "Failed to fetch" impossible à diagnostiquer).
+process.on("unhandledRejection", (reason) => {
+  console.error("[cs2-vod-fr] Unhandled rejection :", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[cs2-vod-fr] Uncaught exception :", err);
+});
+
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Délai dépassé (${ms / 1000}s) en interrogeant HLTV.`)),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 // --- Petit cache mémoire pour éviter de re-scraper HLTV à chaque appel -----
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -44,7 +67,9 @@ function simplifyMatch(raw, id) {
   const tournament = raw?.event?.name ?? "";
   // "significance" porte généralement l'étape du tournoi (ex: "Quarter-final")
   const stage = raw?.significance ?? "";
-  const formatRaw = raw?.format ?? "";
+  // raw.format est un objet { type: "bo3", location?: "LAN" | "Online" }, pas une
+  // simple chaîne — on en extrait le type et on le remet en majuscules (BO3).
+  const format = raw?.format?.type ? String(raw.format.type).toUpperCase() : "";
 
   return {
     hltvId: String(id),
@@ -52,7 +77,7 @@ function simplifyMatch(raw, id) {
     teamB,
     tournament,
     stage,
-    format: formatRaw,
+    format,
   };
 }
 
@@ -80,7 +105,7 @@ app.get("/match/:id", async (req, res) => {
   }
 
   try {
-    const raw = await HLTV.getMatch({ id: matchId });
+    const raw = await withTimeout(HLTV.getMatch({ id: matchId }), HLTV_TIMEOUT_MS);
 
     if (!raw || (!raw.team1 && !raw.team2)) {
       return res
@@ -92,12 +117,23 @@ app.get("/match/:id", async (req, res) => {
     setCached(matchId, simplified);
     res.json(simplified);
   } catch (err) {
-    console.error(`[cs2-vod-fr] Erreur pour le match ${matchId} :`, err?.message || err);
+    const message = err?.message || String(err);
+    console.error(`[cs2-vod-fr] Erreur pour le match ${matchId} :`, message);
+
+    if (message.includes("Délai dépassé")) {
+      return res.status(504).json({
+        error:
+          "HLTV a mis trop de temps à répondre (probablement un blocage anti-robot). Réessaie dans quelques minutes.",
+      });
+    }
+
     res.status(502).json({
       error:
         "Impossible de récupérer les données depuis HLTV pour le moment (le site a peut-être bloqué la requête, ou le format de la page a changé).",
+      detail: message,
     });
   }
+
 });
 
 // 404 générique pour toute autre route
