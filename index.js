@@ -29,6 +29,8 @@ const PANDASCORE_TOKEN = process.env.PANDASCORE_TOKEN;
 const PANDASCORE_BASE = "https://api.pandascore.co";
 // CS2 utilise encore le préfixe historique /csgo/ chez PandaScore (pas de /cs2/).
 const CS2_MATCHES_PATH = "/csgo/matches";
+// Pour une base de rediffusions, on cherche parmi les matchs déjà terminés.
+const CS2_PAST_MATCHES_PATH = "/csgo/matches/past";
 const REQUEST_TIMEOUT_MS = 15 * 1000;
 
 app.use(cors()); // ouvert à tous les domaines : c'est une API publique en lecture seule
@@ -222,11 +224,14 @@ app.get("/search", async (req, res) => {
 
   try {
     // Recherche plein-texte PandaScore sur le nom du match (souvent formé des noms
-    // d'équipes), triée du plus récent au plus ancien, limitée à 8 résultats.
+    // d'équipes). On demande le tri du plus récent au plus ancien à l'API, mais on
+    // le refait nous-mêmes ci-dessous : en pratique, sort=-begin_at n'est pas fiable
+    // dès que certains matchs renvoyés ont un begin_at manquant (null), ce qui les
+    // mélange n'importe où dans la liste plutôt qu'à la fin.
     const params = new URLSearchParams({
       "search[name]": q,
       sort: "-begin_at",
-      "page[size]": "8",
+      "page[size]": "15",
     });
     const psRes = await pandaScoreFetch(`${CS2_MATCHES_PATH}?${params.toString()}`);
 
@@ -247,7 +252,19 @@ app.get("/search", async (req, res) => {
     }
 
     const rawList = await psRes.json();
-    const results = Array.isArray(rawList) ? rawList.map(extractMatchFields) : [];
+    const results = Array.isArray(rawList)
+      ? rawList
+          .map(extractMatchFields)
+          // Tri garanti du plus récent au plus ancien. Les matchs sans date connue
+          // (begin_at manquant) sont relégués en fin de liste plutôt que de fausser
+          // l'ordre des matchs datés.
+          .sort((a, b) => {
+            const timeA = a.beginAt ? new Date(a.beginAt).getTime() : -Infinity;
+            const timeB = b.beginAt ? new Date(b.beginAt).getTime() : -Infinity;
+            return timeB - timeA;
+          })
+          .slice(0, 8)
+      : [];
     const payload = { results };
     setCached(cacheKey, payload);
     res.json(payload);
