@@ -4,13 +4,20 @@ import cors from "cors";
 /* ============================================================================
    CS2 VOD FR — Proxy PandaScore
    Petit serveur Express qui expose :
-     GET /match/:idOrSlug   → détails d'un match par ID/slug PandaScore
-     GET /search?q=...      → recherche de matchs par nom d'équipe/tournoi
+     GET /match/:idOrSlug         → détails d'un match par ID/slug PandaScore
+     GET /search?q=...            → recherche de matchs (équipe ET/OU tournoi)
+     GET /search-tournaments?q=…  → recherche de tournois (séries PandaScore)
+     GET /tournament/:serieId/matches → tous les matchs d'un tournoi (import en masse)
    au format attendu par App.jsx, en s'appuyant sur l'API PandaScore
    (https://developers.pandascore.co).
 
    ⚠️ PandaScore n'autorise pas les appels directs depuis le navigateur (pas de
    CORS côté leur API) — c'est justement pour ça qu'on passe par ce proxy.
+
+   Hiérarchie PandaScore : League → Series (= "tournoi" dans notre app) →
+   Tournament (= une phase/stage à l'intérieur d'une série) → Match → Game.
+   Piège de nommage : le "Tournament" de PandaScore correspond à notre "stage",
+   pas à notre "tournament" (qui correspond à leur "Series").
 
    Variable d'environnement requise sur Render :
      PANDASCORE_TOKEN = ton token PandaScore (Dashboard → Settings → Tokens)
@@ -29,8 +36,7 @@ const PANDASCORE_TOKEN = process.env.PANDASCORE_TOKEN;
 const PANDASCORE_BASE = "https://api.pandascore.co";
 // CS2 utilise encore le préfixe historique /csgo/ chez PandaScore (pas de /cs2/).
 const CS2_MATCHES_PATH = "/csgo/matches";
-// Pour une base de rediffusions, on cherche parmi les matchs déjà terminés.
-const CS2_PAST_MATCHES_PATH = "/csgo/matches/past";
+const CS2_SERIES_PATH = "/csgo/series";
 const REQUEST_TIMEOUT_MS = 15 * 1000;
 
 app.use(cors()); // ouvert à tous les domaines : c'est une API publique en lecture seule
@@ -91,6 +97,33 @@ async function pandaScoreFetch(path) {
   }
 }
 
+// Lève une erreur "propre" (avec code HTTP + message FR) à partir d'une réponse
+// PandaScore non-OK, pour que tous les routes gèrent les erreurs de la même façon.
+async function assertOk(psRes) {
+  if (psRes.status === 401 || psRes.status === 403) {
+    const err = new Error(
+      "PandaScore a refusé la requête (token invalide, expiré ou manquant). Vérifie PANDASCORE_TOKEN sur Render."
+    );
+    err.httpStatus = 502;
+    throw err;
+  }
+  if (psRes.status === 429) {
+    const err = new Error(
+      "Quota PandaScore dépassé pour cette heure (plan gratuit : 1000 requêtes/heure)."
+    );
+    err.httpStatus = 429;
+    throw err;
+  }
+  if (!psRes.ok) {
+    const bodyText = await psRes.text().catch(() => "");
+    const err = new Error(
+      `PandaScore a répondu avec le statut ${psRes.status} : ${bodyText.slice(0, 200)}`
+    );
+    err.httpStatus = 502;
+    throw err;
+  }
+}
+
 // --- Mise en forme d'un objet "Match" PandaScore vers un format simple -------
 // Doc du schéma "Match" PandaScore : id, name, begin_at, opponents[], serie,
 // league, tournament, number_of_games (le "Best of"), videogame, etc.
@@ -112,6 +145,7 @@ function extractMatchFields(raw) {
 
   return {
     pandascoreId: raw?.id != null ? String(raw.id) : "",
+    serieId: raw?.serie_id != null ? String(raw.serie_id) : raw?.serie?.id != null ? String(raw.serie.id) : "",
     teamA,
     teamB,
     tournament,
@@ -120,6 +154,38 @@ function extractMatchFields(raw) {
     beginAt: raw?.begin_at ?? null,
     name: raw?.name ?? "",
   };
+}
+
+// --- Mise en forme d'un objet "Series" (= "tournoi" dans notre app) ----------
+function extractSerieFields(raw) {
+  const leagueName = raw?.league?.name ?? "";
+  const label = [leagueName, raw?.full_name ?? raw?.name ?? ""].filter(Boolean).join(" ").trim();
+  return {
+    serieId: raw?.id != null ? String(raw.id) : "",
+    label: label || raw?.full_name || raw?.name || "",
+    beginAt: raw?.begin_at ?? null,
+    endAt: raw?.end_at ?? null,
+  };
+}
+
+function dedupeById(items, keyFn) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const key = keyFn(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function sortByDateDesc(items, dateFn) {
+  return [...items].sort((a, b) => {
+    const ta = dateFn(a) ? new Date(dateFn(a)).getTime() : -Infinity;
+    const tb = dateFn(b) ? new Date(dateFn(b)).getTime() : -Infinity;
+    return tb - ta;
+  });
 }
 
 function errorPayloadFor(err) {
@@ -138,6 +204,9 @@ function errorPayloadFor(err) {
       body: { error: "Délai dépassé en interrogeant PandaScore. Réessaie dans un instant." },
     };
   }
+  if (err?.httpStatus) {
+    return { status: err.httpStatus, body: { error: err.message } };
+  }
   return {
     status: 502,
     body: {
@@ -154,8 +223,10 @@ app.get("/", (req, res) => {
     status: "ok",
     service: "cs2-vod-fr proxy (PandaScore)",
     usage: [
-      "GET /match/:idOrSlug   — détails d'un match PandaScore",
-      "GET /search?q=...      — recherche de matchs par équipe/tournoi",
+      "GET /match/:idOrSlug              — détails d'un match PandaScore",
+      "GET /search?q=...                 — recherche de matchs (équipe et/ou tournoi)",
+      "GET /search-tournaments?q=...     — recherche de tournois (séries)",
+      "GET /tournament/:serieId/matches  — tous les matchs d'un tournoi",
     ],
     tokenConfigured: Boolean(PANDASCORE_TOKEN),
   });
@@ -182,21 +253,7 @@ app.get("/match/:idOrSlug", async (req, res) => {
         .status(404)
         .json({ error: `Aucun match PandaScore trouvé pour "${idOrSlug}".` });
     }
-    if (psRes.status === 401 || psRes.status === 403) {
-      return res.status(502).json({
-        error:
-          "PandaScore a refusé la requête (token invalide, expiré ou manquant). Vérifie PANDASCORE_TOKEN sur Render.",
-      });
-    }
-    if (psRes.status === 429) {
-      return res.status(429).json({
-        error: "Quota PandaScore dépassé pour cette heure (plan gratuit : 1000 requêtes/heure).",
-      });
-    }
-    if (!psRes.ok) {
-      const bodyText = await psRes.text().catch(() => "");
-      throw new Error(`PandaScore a répondu avec le statut ${psRes.status} : ${bodyText.slice(0, 200)}`);
-    }
+    await assertOk(psRes);
 
     const raw = await psRes.json();
     const simplified = extractMatchFields(raw);
@@ -209,6 +266,11 @@ app.get("/match/:idOrSlug", async (req, res) => {
   }
 });
 
+// Recherche combinée : matchs dont le NOM correspond (ex: noms d'équipes) +
+// matchs appartenant à un TOURNOI (série) dont le nom correspond. PandaScore ne
+// recherche que sur le champ demandé (search[name] ne regarde que le nom du
+// match, qui ne contient quasiment jamais le nom du tournoi) — d'où la
+// recherche en deux temps ci-dessous pour couvrir les deux cas.
 app.get("/search", async (req, res) => {
   const q = (req.query.q || "").toString().trim();
 
@@ -223,49 +285,64 @@ app.get("/search", async (req, res) => {
   }
 
   try {
-    // Recherche plein-texte PandaScore sur le nom du match (souvent formé des noms
-    // d'équipes). On demande le tri du plus récent au plus ancien à l'API, mais on
-    // le refait nous-mêmes ci-dessous : en pratique, sort=-begin_at n'est pas fiable
-    // dès que certains matchs renvoyés ont un begin_at manquant (null), ce qui les
-    // mélange n'importe où dans la liste plutôt qu'à la fin.
-    const params = new URLSearchParams({
+    // 1) Matchs dont le nom correspond (typiquement une recherche par équipe)
+    const matchParams = new URLSearchParams({
       "search[name]": q,
       sort: "-begin_at",
-      "page[size]": "15",
+      "page[size]": "40",
     });
-    const psRes = await pandaScoreFetch(`${CS2_MATCHES_PATH}?${params.toString()}`);
+    const matchesReq = pandaScoreFetch(`${CS2_MATCHES_PATH}?${matchParams.toString()}`);
 
-    if (psRes.status === 401 || psRes.status === 403) {
-      return res.status(502).json({
-        error:
-          "PandaScore a refusé la requête (token invalide, expiré ou manquant). Vérifie PANDASCORE_TOKEN sur Render.",
-      });
-    }
-    if (psRes.status === 429) {
-      return res.status(429).json({
-        error: "Quota PandaScore dépassé pour cette heure (plan gratuit : 1000 requêtes/heure).",
-      });
-    }
-    if (!psRes.ok) {
-      const bodyText = await psRes.text().catch(() => "");
-      throw new Error(`PandaScore a répondu avec le statut ${psRes.status} : ${bodyText.slice(0, 200)}`);
+    // 2) Tournois (séries) dont le nom correspond, puis leurs matchs récents
+    const serieParams = new URLSearchParams({
+      "search[full_name]": q,
+      sort: "-begin_at",
+      "page[size]": "5",
+    });
+    const seriesReq = pandaScoreFetch(`${CS2_SERIES_PATH}?${serieParams.toString()}`);
+
+    const [matchesRes, seriesRes] = await Promise.all([matchesReq, seriesReq]);
+
+    let matchResults = [];
+    if (matchesRes.ok) {
+      const rawMatches = await matchesRes.json();
+      matchResults = Array.isArray(rawMatches) ? rawMatches.map(extractMatchFields) : [];
     }
 
-    const rawList = await psRes.json();
-    const results = Array.isArray(rawList)
-      ? rawList
-          .map(extractMatchFields)
-          // Tri garanti du plus récent au plus ancien. Les matchs sans date connue
-          // (begin_at manquant) sont relégués en fin de liste plutôt que de fausser
-          // l'ordre des matchs datés.
-          .sort((a, b) => {
-            const timeA = a.beginAt ? new Date(a.beginAt).getTime() : -Infinity;
-            const timeB = b.beginAt ? new Date(b.beginAt).getTime() : -Infinity;
-            return timeB - timeA;
-          })
-          .slice(0, 8)
-      : [];
-    const payload = { results };
+    let serieMatchResults = [];
+    if (seriesRes.ok) {
+      const rawSeries = await seriesRes.json();
+      const series = Array.isArray(rawSeries) ? rawSeries : [];
+      // Pour chaque tournoi trouvé, on récupère ses matchs les plus récents.
+      const perSerie = await Promise.all(
+        series.slice(0, 5).map(async (serie) => {
+          try {
+            const p = new URLSearchParams({
+              "filter[serie_id]": String(serie.id),
+              sort: "-begin_at",
+              "page[size]": "20",
+            });
+            const r = await pandaScoreFetch(`${CS2_MATCHES_PATH}?${p.toString()}`);
+            if (!r.ok) return [];
+            const rawList = await r.json();
+            return Array.isArray(rawList) ? rawList.map(extractMatchFields) : [];
+          } catch {
+            return [];
+          }
+        })
+      );
+      serieMatchResults = perSerie.flat();
+    }
+
+    // Si aucune des deux requêtes n'a abouti, on remonte une vraie erreur.
+    if (!matchesRes.ok && !seriesRes.ok) {
+      await assertOk(matchesRes);
+    }
+
+    const merged = dedupeById([...matchResults, ...serieMatchResults], (m) => m.pandascoreId);
+    const sorted = sortByDateDesc(merged, (m) => m.beginAt).slice(0, 40);
+
+    const payload = { results: sorted };
     setCached(cacheKey, payload);
     res.json(payload);
   } catch (err) {
@@ -275,9 +352,94 @@ app.get("/search", async (req, res) => {
   }
 });
 
+// Recherche de tournois (séries PandaScore) par nom — pour l'import en masse.
+app.get("/search-tournaments", async (req, res) => {
+  const q = (req.query.q || "").toString().trim();
+
+  if (!q) {
+    return res.status(400).json({ error: "Paramètre de recherche 'q' manquant." });
+  }
+
+  const cacheKey = `search-tournaments:${q.toLowerCase()}`;
+  const cached = getCached(cacheKey);
+  if (cached) {
+    return res.json({ ...cached, cached: true });
+  }
+
+  try {
+    const params = new URLSearchParams({
+      "search[full_name]": q,
+      sort: "-begin_at",
+      "page[size]": "15",
+    });
+    const psRes = await pandaScoreFetch(`${CS2_SERIES_PATH}?${params.toString()}`);
+    await assertOk(psRes);
+
+    const rawList = await psRes.json();
+    const results = Array.isArray(rawList) ? rawList.map(extractSerieFields) : [];
+    const sorted = sortByDateDesc(results, (s) => s.beginAt);
+
+    const payload = { results: sorted };
+    setCached(cacheKey, payload);
+    res.json(payload);
+  } catch (err) {
+    console.error(`[cs2-vod-fr] Erreur de recherche de tournois "${q}" :`, err?.message || err);
+    const { status, body } = errorPayloadFor(err);
+    res.status(status).json(body);
+  }
+});
+
+// Tous les matchs d'un tournoi (série) donné — pour l'import en masse.
+app.get("/tournament/:serieId/matches", async (req, res) => {
+  const { serieId } = req.params;
+  const id = Number(serieId);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: "ID de tournoi (série) PandaScore invalide." });
+  }
+
+  const cacheKey = `tournament-matches:${id}`;
+  const cached = getCached(cacheKey);
+  if (cached) {
+    return res.json({ ...cached, cached: true });
+  }
+
+  try {
+    // Page max autorisée par PandaScore (100). Suffisant pour l'immense majorité
+    // des tournois CS2 ; les séries plus longues seraient à paginer davantage.
+    const params = new URLSearchParams({
+      "filter[serie_id]": String(id),
+      sort: "begin_at",
+      "page[size]": "100",
+    });
+    const psRes = await pandaScoreFetch(`${CS2_MATCHES_PATH}?${params.toString()}`);
+    await assertOk(psRes);
+
+    const rawList = await psRes.json();
+    const results = Array.isArray(rawList) ? rawList.map(extractMatchFields) : [];
+
+    if (results.length === 0) {
+      return res
+        .status(404)
+        .json({ error: `Aucun match trouvé pour ce tournoi (série ${id}).` });
+    }
+
+    const payload = { results };
+    setCached(cacheKey, payload);
+    res.json(payload);
+  } catch (err) {
+    console.error(`[cs2-vod-fr] Erreur import tournoi ${id} :`, err?.message || err);
+    const { status, body } = errorPayloadFor(err);
+    res.status(status).json(body);
+  }
+});
+
 // 404 générique pour toute autre route
 app.use((req, res) => {
-  res.status(404).json({ error: "Route inconnue. Utilise GET /match/:idOrSlug ou GET /search?q=..." });
+  res.status(404).json({
+    error:
+      "Route inconnue. Utilise GET /match/:idOrSlug, /search?q=…, /search-tournaments?q=… ou /tournament/:serieId/matches.",
+  });
 });
 
 app.listen(PORT, () => {
