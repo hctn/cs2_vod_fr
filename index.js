@@ -36,6 +36,7 @@ const PANDASCORE_TOKEN = process.env.PANDASCORE_TOKEN;
 const PANDASCORE_BASE = "https://api.pandascore.co";
 // CS2 utilise encore le préfixe historique /csgo/ chez PandaScore (pas de /cs2/).
 const CS2_MATCHES_PATH = "/csgo/matches";
+const CS2_PAST_MATCHES_PATH = "/csgo/matches/past";
 const CS2_SERIES_PATH = "/csgo/series";
 const REQUEST_TIMEOUT_MS = 15 * 1000;
 
@@ -293,10 +294,13 @@ app.get("/search", async (req, res) => {
     });
     const matchesReq = pandaScoreFetch(`${CS2_MATCHES_PATH}?${matchParams.toString()}`);
 
-    // 2) Tournois (séries) dont le nom correspond, puis leurs matchs récents
+    // 2) Tournois (séries) dont le nom correspond, puis leurs matchs récents.
+    // Note : le champ "recherchable" exposé par l'API pour une série est "name",
+    // pas "full_name" (qui existe dans la réponse mais n'est pas un attribut de
+    // filtre/recherche valide — d'où l'erreur 400 "Provided attributes do not
+    // exist for this resource" si on l'utilise).
     const serieParams = new URLSearchParams({
-      "search[full_name]": q,
-      sort: "-begin_at",
+      "search[name]": q,
       "page[size]": "5",
     });
     const seriesReq = pandaScoreFetch(`${CS2_SERIES_PATH}?${serieParams.toString()}`);
@@ -307,13 +311,20 @@ app.get("/search", async (req, res) => {
     if (matchesRes.ok) {
       const rawMatches = await matchesRes.json();
       matchResults = Array.isArray(rawMatches) ? rawMatches.map(extractMatchFields) : [];
+    } else {
+      console.error(
+        `[cs2-vod-fr] Recherche de matchs "${q}" a échoué (${matchesRes.status}) :`,
+        await matchesRes.text().catch(() => "")
+      );
     }
 
     let serieMatchResults = [];
     if (seriesRes.ok) {
       const rawSeries = await seriesRes.json();
       const series = Array.isArray(rawSeries) ? rawSeries : [];
-      // Pour chaque tournoi trouvé, on récupère ses matchs les plus récents.
+      // Pour chaque tournoi trouvé, on récupère ses matchs terminés. Le filtre
+      // serie_id n'est disponible que sur la sous-ressource /matches/past (pas
+      // sur l'index générique /csgo/matches).
       const perSerie = await Promise.all(
         series.slice(0, 5).map(async (serie) => {
           try {
@@ -322,8 +333,14 @@ app.get("/search", async (req, res) => {
               sort: "-begin_at",
               "page[size]": "20",
             });
-            const r = await pandaScoreFetch(`${CS2_MATCHES_PATH}?${p.toString()}`);
-            if (!r.ok) return [];
+            const r = await pandaScoreFetch(`${CS2_PAST_MATCHES_PATH}?${p.toString()}`);
+            if (!r.ok) {
+              console.error(
+                `[cs2-vod-fr] Matchs de la série ${serie.id} inaccessibles (${r.status}) :`,
+                await r.text().catch(() => "")
+              );
+              return [];
+            }
             const rawList = await r.json();
             return Array.isArray(rawList) ? rawList.map(extractMatchFields) : [];
           } catch {
@@ -332,6 +349,11 @@ app.get("/search", async (req, res) => {
         })
       );
       serieMatchResults = perSerie.flat();
+    } else {
+      console.error(
+        `[cs2-vod-fr] Recherche de tournois "${q}" a échoué (${seriesRes.status}) :`,
+        await seriesRes.text().catch(() => "")
+      );
     }
 
     // Si aucune des deux requêtes n'a abouti, on remonte une vraie erreur.
@@ -368,8 +390,7 @@ app.get("/search-tournaments", async (req, res) => {
 
   try {
     const params = new URLSearchParams({
-      "search[full_name]": q,
-      sort: "-begin_at",
+      "search[name]": q,
       "page[size]": "15",
     });
     const psRes = await pandaScoreFetch(`${CS2_SERIES_PATH}?${params.toString()}`);
@@ -407,12 +428,15 @@ app.get("/tournament/:serieId/matches", async (req, res) => {
   try {
     // Page max autorisée par PandaScore (100). Suffisant pour l'immense majorité
     // des tournois CS2 ; les séries plus longues seraient à paginer davantage.
+    // Le filtre serie_id n'est disponible que sur /matches/past (pas sur l'index
+    // générique /csgo/matches) — c'est aussi le sous-ensemble qui nous intéresse
+    // ici, puisqu'on importe des matchs déjà joués pour y attacher des VODs.
     const params = new URLSearchParams({
       "filter[serie_id]": String(id),
       sort: "begin_at",
       "page[size]": "100",
     });
-    const psRes = await pandaScoreFetch(`${CS2_MATCHES_PATH}?${params.toString()}`);
+    const psRes = await pandaScoreFetch(`${CS2_PAST_MATCHES_PATH}?${params.toString()}`);
     await assertOk(psRes);
 
     const rawList = await psRes.json();
