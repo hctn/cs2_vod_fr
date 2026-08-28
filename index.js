@@ -19,6 +19,14 @@ import cors from "cors";
    Piège de nommage : le "Tournament" de PandaScore correspond à notre "stage",
    pas à notre "tournament" (qui correspond à leur "Series").
 
+   Piège n°2 (celui qui cassait la recherche par tournoi) : le champ "name"
+   d'une Series ne contient souvent QUE l'édition ("2026", "Summer 2026"), pas
+   le nom de la League ("Esports World Cup"). Or search[name] de PandaScore
+   fait un test "le champ CONTIENT la sous-chaîne cherchée" — donc chercher
+   "Esports World Cup 2026" directement sur les séries ne matche presque
+   jamais. La fonction findMatchingSeries() ci-dessous corrige ça en
+   cherchant aussi sur les Leagues, puis en récupérant leurs séries.
+
    Variable d'environnement requise sur Render :
      PANDASCORE_TOKEN = ton token PandaScore (Dashboard → Settings → Tokens)
      https://pandascore.co/settings
@@ -38,6 +46,7 @@ const PANDASCORE_BASE = "https://api.pandascore.co";
 const CS2_MATCHES_PATH = "/csgo/matches";
 const CS2_PAST_MATCHES_PATH = "/csgo/matches/past";
 const CS2_SERIES_PATH = "/csgo/series";
+const CS2_LEAGUES_PATH = "/csgo/leagues";
 const REQUEST_TIMEOUT_MS = 15 * 1000;
 
 app.use(cors()); // ouvert à tous les domaines : c'est une API publique en lecture seule
@@ -217,6 +226,90 @@ function errorPayloadFor(err) {
   };
 }
 
+// --- Recherche de séries (= "tournois") -------------------------------------
+// Combine deux stratégies, car le champ "name" d'une Series PandaScore ne
+// contient souvent QUE l'édition (ex: "2026", "Summer 2026"), pas le nom de
+// la League (ex: "Esports World Cup"). Une recherche search[name] fait un
+// test "le champ CONTIENT la sous-chaîne cherchée" : chercher directement
+// "Esports World Cup 2026" sur les séries ne matche donc presque jamais.
+//   1) recherche directe sur le nom de la série (couvre le cas où l'édition
+//      est nommée explicitement, ex: nom de série = "IEM Katowice 2026")
+//   2) recherche sur le nom de la LEAGUE, puis récupération de ses séries via
+//      filter[league_id] — c'est ce deuxième chemin qui couvre "Esports World
+//      Cup 2026", "IEM Katowice", etc.
+// Renvoie une liste dédupliquée d'objets "Serie" bruts PandaScore.
+async function findMatchingSeries(q) {
+  const serieParams = new URLSearchParams({
+    "search[name]": q,
+    "page[size]": "10",
+  });
+  const leagueParams = new URLSearchParams({
+    "search[name]": q,
+    "page[size]": "5",
+  });
+
+  const [directSeriesRes, leaguesRes] = await Promise.all([
+    pandaScoreFetch(`${CS2_SERIES_PATH}?${serieParams.toString()}`),
+    pandaScoreFetch(`${CS2_LEAGUES_PATH}?${leagueParams.toString()}`),
+  ]);
+
+  let directSeries = [];
+  if (directSeriesRes.ok) {
+    const raw = await directSeriesRes.json();
+    directSeries = Array.isArray(raw) ? raw : [];
+  } else {
+    console.error(
+      `[cs2-vod-fr] Recherche directe de séries "${q}" a échoué (${directSeriesRes.status}) :`,
+      await directSeriesRes.text().catch(() => "")
+    );
+  }
+
+  let seriesFromLeagues = [];
+  if (leaguesRes.ok) {
+    const rawLeagues = await leaguesRes.json();
+    const leagues = Array.isArray(rawLeagues) ? rawLeagues : [];
+    const perLeague = await Promise.all(
+      leagues.slice(0, 5).map(async (league) => {
+        try {
+          const p = new URLSearchParams({
+            "filter[league_id]": String(league.id),
+            sort: "-begin_at",
+            "page[size]": "10",
+          });
+          const r = await pandaScoreFetch(`${CS2_SERIES_PATH}?${p.toString()}`);
+          if (!r.ok) {
+            console.error(
+              `[cs2-vod-fr] Séries de la league ${league.id} inaccessibles (${r.status}) :`,
+              await r.text().catch(() => "")
+            );
+            return [];
+          }
+          const rawList = await r.json();
+          return Array.isArray(rawList) ? rawList : [];
+        } catch {
+          return [];
+        }
+      })
+    );
+    seriesFromLeagues = perLeague.flat();
+  } else {
+    console.error(
+      `[cs2-vod-fr] Recherche de leagues "${q}" a échoué (${leaguesRes.status}) :`,
+      await leaguesRes.text().catch(() => "")
+    );
+  }
+
+  // Si les deux appels ont échoué, on remonte une vraie erreur à l'appelant
+  // plutôt que de silencieusement renvoyer une liste vide.
+  if (!directSeriesRes.ok && !leaguesRes.ok) {
+    await assertOk(directSeriesRes);
+  }
+
+  return dedupeById([...directSeries, ...seriesFromLeagues], (s) =>
+    s?.id != null ? String(s.id) : null
+  );
+}
+
 // --- Routes ------------------------------------------------------------
 
 app.get("/", (req, res) => {
@@ -268,10 +361,8 @@ app.get("/match/:idOrSlug", async (req, res) => {
 });
 
 // Recherche combinée : matchs dont le NOM correspond (ex: noms d'équipes) +
-// matchs appartenant à un TOURNOI (série) dont le nom correspond. PandaScore ne
-// recherche que sur le champ demandé (search[name] ne regarde que le nom du
-// match, qui ne contient quasiment jamais le nom du tournoi) — d'où la
-// recherche en deux temps ci-dessous pour couvrir les deux cas.
+// matchs appartenant à un TOURNOI (série, trouvée via findMatchingSeries —
+// qui cherche aussi sur les leagues) dont le nom correspond.
 app.get("/search", async (req, res) => {
   const q = (req.query.q || "").toString().trim();
 
@@ -292,20 +383,7 @@ app.get("/search", async (req, res) => {
       sort: "-begin_at",
       "page[size]": "40",
     });
-    const matchesReq = pandaScoreFetch(`${CS2_MATCHES_PATH}?${matchParams.toString()}`);
-
-    // 2) Tournois (séries) dont le nom correspond, puis leurs matchs récents.
-    // Note : le champ "recherchable" exposé par l'API pour une série est "name",
-    // pas "full_name" (qui existe dans la réponse mais n'est pas un attribut de
-    // filtre/recherche valide — d'où l'erreur 400 "Provided attributes do not
-    // exist for this resource" si on l'utilise).
-    const serieParams = new URLSearchParams({
-      "search[name]": q,
-      "page[size]": "5",
-    });
-    const seriesReq = pandaScoreFetch(`${CS2_SERIES_PATH}?${serieParams.toString()}`);
-
-    const [matchesRes, seriesRes] = await Promise.all([matchesReq, seriesReq]);
+    const matchesRes = await pandaScoreFetch(`${CS2_MATCHES_PATH}?${matchParams.toString()}`);
 
     let matchResults = [];
     if (matchesRes.ok) {
@@ -318,15 +396,15 @@ app.get("/search", async (req, res) => {
       );
     }
 
+    // 2) Tournois (leagues + séries) dont le nom correspond, puis leurs matchs
+    // récents. Le filtre serie_id n'est disponible que sur la sous-ressource
+    // /matches/past (pas sur l'index générique /csgo/matches).
     let serieMatchResults = [];
-    if (seriesRes.ok) {
-      const rawSeries = await seriesRes.json();
-      const series = Array.isArray(rawSeries) ? rawSeries : [];
-      // Pour chaque tournoi trouvé, on récupère ses matchs terminés. Le filtre
-      // serie_id n'est disponible que sur la sous-ressource /matches/past (pas
-      // sur l'index générique /csgo/matches).
+    let seriesLookupFailed = false;
+    try {
+      const series = await findMatchingSeries(q);
       const perSerie = await Promise.all(
-        series.slice(0, 5).map(async (serie) => {
+        series.slice(0, 8).map(async (serie) => {
           try {
             const p = new URLSearchParams({
               "filter[serie_id]": String(serie.id),
@@ -349,15 +427,13 @@ app.get("/search", async (req, res) => {
         })
       );
       serieMatchResults = perSerie.flat();
-    } else {
-      console.error(
-        `[cs2-vod-fr] Recherche de tournois "${q}" a échoué (${seriesRes.status}) :`,
-        await seriesRes.text().catch(() => "")
-      );
+    } catch (err) {
+      seriesLookupFailed = true;
+      console.error(`[cs2-vod-fr] Recherche de séries pour "${q}" a échoué :`, err?.message || err);
     }
 
-    // Si aucune des deux requêtes n'a abouti, on remonte une vraie erreur.
-    if (!matchesRes.ok && !seriesRes.ok) {
+    // Si aucune des deux stratégies n'a abouti, on remonte une vraie erreur.
+    if (!matchesRes.ok && seriesLookupFailed) {
       await assertOk(matchesRes);
     }
 
@@ -374,7 +450,8 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// Recherche de tournois (séries PandaScore) par nom — pour l'import en masse.
+// Recherche de tournois (leagues + séries PandaScore) par nom — pour l'import
+// en masse. Voir findMatchingSeries() pour le détail de la stratégie.
 app.get("/search-tournaments", async (req, res) => {
   const q = (req.query.q || "").toString().trim();
 
@@ -389,15 +466,8 @@ app.get("/search-tournaments", async (req, res) => {
   }
 
   try {
-    const params = new URLSearchParams({
-      "search[name]": q,
-      "page[size]": "15",
-    });
-    const psRes = await pandaScoreFetch(`${CS2_SERIES_PATH}?${params.toString()}`);
-    await assertOk(psRes);
-
-    const rawList = await psRes.json();
-    const results = Array.isArray(rawList) ? rawList.map(extractSerieFields) : [];
+    const series = await findMatchingSeries(q);
+    const results = series.map(extractSerieFields);
     const sorted = sortByDateDesc(results, (s) => s.beginAt);
 
     const payload = { results: sorted };
