@@ -27,9 +27,10 @@ import cors from "cors";
    jamais. La fonction findMatchingSeries() ci-dessous corrige ça en
    cherchant aussi sur les Leagues, puis en récupérant leurs séries.
 
-   Logos d'équipes : chaque "opponent" PandaScore expose déjà un champ
-   "image_url" (logo de l'équipe/joueur). extractMatchFields() le récupère
-   pour teamA et teamB sous les clés teamALogo / teamBLogo, en plus des noms.
+   Logos d'équipe : chaque "opponent" PandaScore expose un champ image_url
+   (logo de l'équipe/joueur). On le remonte sous teamALogo / teamBLogo pour
+   que le front puisse afficher les logos, notamment lors de l'import en
+   masse d'un tournoi entier.
 
    Variable d'environnement requise sur Render :
      PANDASCORE_TOKEN = ton token PandaScore (Dashboard → Settings → Tokens)
@@ -141,14 +142,11 @@ async function assertOk(psRes) {
 // --- Mise en forme d'un objet "Match" PandaScore vers un format simple -------
 // Doc du schéma "Match" PandaScore : id, name, begin_at, opponents[], serie,
 // league, tournament, number_of_games (le "Best of"), videogame, etc.
-// Chaque entrée d'"opponents" a la forme { type: "Team"|"Player", opponent: {
-// id, name, image_url, ... } } — image_url est l'URL du logo de l'équipe
-// (ou l'avatar du joueur pour les matchs 1v1 hors CS2, mais on ne l'utilise
-// pas ici).
 function extractMatchFields(raw) {
   const opponents = Array.isArray(raw?.opponents) ? raw.opponents : [];
   const teamA = opponents[0]?.opponent?.name ?? "";
   const teamB = opponents[1]?.opponent?.name ?? "";
+  // Logo de chaque équipe (champ image_url de l'opponent PandaScore).
   const teamALogo = opponents[0]?.opponent?.image_url ?? "";
   const teamBLogo = opponents[1]?.opponent?.image_url ?? "";
 
