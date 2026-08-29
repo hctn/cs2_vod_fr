@@ -32,6 +32,13 @@ import cors from "cors";
    que le front puisse afficher les logos, notamment lors de l'import en
    masse d'un tournoi entier.
 
+   Logo de tournoi : PandaScore ne porte PAS de logo sur l'objet "Series" —
+   c'est la League parente qui a le champ image_url (ex: le logo "IEM" est
+   sur la League "IEM", pas sur la série "IEM Katowice 2026"). On l'expose
+   quand même côté front sous le nom "tournamentLogo", puisque notre notion
+   de "tournoi" correspond à league + serie combinés (voir extractMatchFields
+   et extractSerieFields ci-dessous).
+
    Variable d'environnement requise sur Render :
      PANDASCORE_TOKEN = ton token PandaScore (Dashboard → Settings → Tokens)
      https://pandascore.co/settings
@@ -155,6 +162,11 @@ function extractMatchFields(raw) {
   const serieName = raw?.serie?.full_name ?? "";
   const tournament = [leagueName, serieName].filter(Boolean).join(" ").trim();
 
+  // Logo du tournoi : porté par la League (pas par la Series elle-même) —
+  // voir la note en tête de fichier. On retombe sur serie.league.image_url
+  // au cas où l'API imbrique la league sous la série selon l'endpoint.
+  const tournamentLogo = raw?.league?.image_url ?? raw?.serie?.league?.image_url ?? "";
+
   // L'étape (ex: "Quarterfinal", "Group A") est portée par l'objet "tournament" de
   // PandaScore (qui correspond à une phase à l'intérieur d'une série — nommage piégeux).
   const stage = raw?.tournament?.name ?? "";
@@ -169,6 +181,7 @@ function extractMatchFields(raw) {
     teamALogo,
     teamBLogo,
     tournament,
+    tournamentLogo,
     stage,
     format,
     beginAt: raw?.begin_at ?? null,
@@ -180,9 +193,12 @@ function extractMatchFields(raw) {
 function extractSerieFields(raw) {
   const leagueName = raw?.league?.name ?? "";
   const label = [leagueName, raw?.full_name ?? raw?.name ?? ""].filter(Boolean).join(" ").trim();
+  // Voir la note en tête de fichier : le logo vit sur la League, pas la Series.
+  const logo = raw?.league?.image_url ?? "";
   return {
     serieId: raw?.id != null ? String(raw.id) : "",
     label: label || raw?.full_name || raw?.name || "",
+    logo,
     beginAt: raw?.begin_at ?? null,
     endAt: raw?.end_at ?? null,
   };
